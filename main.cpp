@@ -2,7 +2,7 @@
 // Licensed under the Apache License, Version 2.0
 
 #ifndef ESP32
-  #error This code only runs on an ESP32
+  #error This example runs on ESP32
 #endif
 
 #include <Arduino.h>
@@ -12,31 +12,34 @@
 // SYSTEM CONSTANTS & CONFIGURATION
 // ============================================================================
 
-// LiDAR Configuration
+// LiDAR Configuration (LD20)
 const uint8_t LIDAR_GPIO_EN  = 14;
 const uint8_t LIDAR_GPIO_RX  = 3;   
 const uint8_t LIDAR_GPIO_TX  = 1;   
 const uint8_t LIDAR_GPIO_PWM = 13;
 
 const uint32_t SERIAL_MONITOR_BAUD = 115200;
-const uint32_t LIDAR_PWM_FREQ = 10000;
-const uint8_t LIDAR_PWM_BITS = 11;
-const uint8_t LIDAR_PWM_CHANNEL = 2;
 
-// Assuming LDROBOT LD14P protocol is compatible with LD20, 
-// otherwise use the generic serial parser provided by your library.
-#define LDROBOT_LD14P 
+#define LDROBOT_LD14P // LD20 protocol equivalent
 
-// Motor & Navigation Constants
-const uint8_t LEFT_MOTOR_PIN = 25;
-const uint8_t RIGHT_MOTOR_PIN = 26;
+// --- L298N Motor Driver Pins ---
+// Left Side
+const uint8_t L298N_ENA = 27; // PWM Left
+const uint8_t L298N_IN1 = 26; // Dir Left A
+const uint8_t L298N_IN2 = 25; // Dir Left B
+// Right Side
+const uint8_t L298N_ENB = 12; // PWM Right
+const uint8_t L298N_IN3 = 33; // Dir Right A
+const uint8_t L298N_IN4 = 32; // Dir Right B
+
+// PWM Settings
 const uint8_t MOTOR_PWM_CHANNEL_LEFT = 3;
 const uint8_t MOTOR_PWM_CHANNEL_RIGHT = 4;
-const uint8_t MOTOR_PWM_FREQ = 5000;
+const uint32_t MOTOR_PWM_FREQ = 5000;
 const uint8_t MOTOR_PWM_RESOLUTION = 8; // 0-255
 
 // 20% Power Calculation: 255 * 0.20 = 51
-const uint8_t PWM_20_PERCENT = 51; 
+const int16_t PWM_20_PERCENT = 51; 
 const uint16_t COLLISION_THRESHOLD_MM = 300; // 30cm keep-out zone
 
 // ============================================================================
@@ -71,41 +74,63 @@ static int16_t tracked_angle_start = -1;
 static int16_t target_heading = -1;
 static uint32_t turn_start_time = 0;
 static uint32_t turn_duration = 0;
+static bool turning_right = true;
 
 // ============================================================================
-// MOTOR CONTROL ABSTRACTION
+// L298N MOTOR CONTROL ABSTRACTION
 // ============================================================================
 
-/*
-THIS IS SUBJECT TO CHANGE
+// Accepts speeds from -255 to 255. Negative = Reverse, Positive = Forward.
+void setMotors(int16_t left_speed, int16_t right_speed) {
+    
+    // Constrain to valid 8-bit PWM bounds just in case
+    left_speed = constrain(left_speed, -255, 255);
+    right_speed = constrain(right_speed, -255, 255);
 
-Assuming 1 pin per motor for simplicity based on prompt: 
-Applying PWM moves the track forward. Setting to 0 stops it.
-To turn right, the right track stops and the left track drives.
-*/
-void setMotors(uint8_t left_pwm, uint8_t right_pwm) {
-    ledcWrite(MOTOR_PWM_CHANNEL_LEFT, left_pwm);
-    ledcWrite(MOTOR_PWM_CHANNEL_RIGHT, right_pwm);
+    // Left Motor Logic
+    if (left_speed > 0) {
+        digitalWrite(L298N_IN1, HIGH);
+        digitalWrite(L298N_IN2, LOW);
+        ledcWrite(MOTOR_PWM_CHANNEL_LEFT, left_speed);
+    } else if (left_speed < 0) {
+        digitalWrite(L298N_IN1, LOW);
+        digitalWrite(L298N_IN2, HIGH);
+        ledcWrite(MOTOR_PWM_CHANNEL_LEFT, abs(left_speed));
+    } else {
+        digitalWrite(L298N_IN1, LOW);
+        digitalWrite(L298N_IN2, LOW);
+        ledcWrite(MOTOR_PWM_CHANNEL_LEFT, 0);
+    }
+
+    // Right Motor Logic
+    if (right_speed > 0) {
+        digitalWrite(L298N_IN3, HIGH);
+        digitalWrite(L298N_IN4, LOW);
+        ledcWrite(MOTOR_PWM_CHANNEL_RIGHT, right_speed);
+    } else if (right_speed < 0) {
+        digitalWrite(L298N_IN3, LOW);
+        digitalWrite(L298N_IN4, HIGH);
+        ledcWrite(MOTOR_PWM_CHANNEL_RIGHT, abs(right_speed));
+    } else {
+        digitalWrite(L298N_IN3, LOW);
+        digitalWrite(L298N_IN4, LOW);
+        ledcWrite(MOTOR_PWM_CHANNEL_RIGHT, 0);
+    }
 }
-/* END OF SUBJECT TO CHANGE */
 
 // ============================================================================
 // LiDAR CALLBACKS
 // ============================================================================
 
 void lidar_scan_point_callback(float angle_deg, float distance_mm, float quality, bool scan_completed) {
-    // Round angle to nearest integer to act as an array index [0-359]
     int angle_idx = ((int)(angle_deg + 0.5f)) % 360;
     if (angle_idx < 0) angle_idx += 360;
     
-    // Store distance. Ignore 0 readings (invalid/too far)
     if (distance_mm > 0) {
         scan_data[angle_idx] = (uint16_t)distance_mm;
     }
 
-    if (scan_completed) {
-        scan_ready = true;
-    }
+    if (scan_completed) scan_ready = true;
 }
 
 void lidar_info_callback(LDS::info_t code, String info) {
@@ -117,10 +142,9 @@ void lidar_error_callback(LDS::result_t code, String aux_info) {
 }
 
 // ============================================================================
-// NAVIGATION & MATH UTILITIES
+// NAVIGATION MATH UTILITIES
 // ============================================================================
 
-// Finds the angle with the absolute minimum distance (closest object)
 int16_t getClosestObjectAngle() {
     uint16_t min_dist = 0xFFFF;
     int16_t best_angle = -1;
@@ -133,19 +157,16 @@ int16_t getClosestObjectAngle() {
     return best_angle;
 }
 
-// Heuristic: A corner is a local maximum distance flanked by closer walls.
 int16_t findClosestCorner() {
     int16_t closest_corner_angle = -1;
     uint16_t min_corner_dist = 0xFFFF;
 
     for (int i = 0; i < 360; i++) {
-        // Look ahead and behind by 15 degrees to check for local maximum
         int idx_minus = (i - 15 + 360) % 360;
         int idx_plus = (i + 15) % 360;
 
         if (scan_data[i] > 0 && scan_data[idx_minus] > 0 && scan_data[idx_plus] > 0) {
             if (scan_data[i] > scan_data[idx_minus] && scan_data[i] > scan_data[idx_plus]) {
-                // It's a local maximum (potential corner)
                 if (scan_data[i] < min_corner_dist) {
                     min_corner_dist = scan_data[i];
                     closest_corner_angle = i;
@@ -156,7 +177,6 @@ int16_t findClosestCorner() {
     return closest_corner_angle;
 }
 
-// Checks the front 60 degree cone (330 to 30 degrees) for objects within threshold
 bool isPathBlocked() {
     for (int i = 330; i < 360; i++) {
         if (scan_data[i] > 0 && scan_data[i] < COLLISION_THRESHOLD_MM) return true;
@@ -165,6 +185,16 @@ bool isPathBlocked() {
         if (scan_data[i] > 0 && scan_data[i] < COLLISION_THRESHOLD_MM) return true;
     }
     return false;
+}
+
+// Calculates shortest turn direction and angular difference (accounts for 360 wrap)
+int16_t getShortestTurn(int16_t target_angle, bool &turn_right) {
+    int16_t diff = target_angle - 0; // 0 is forward
+    if (diff > 180) diff -= 360;
+    if (diff < -180) diff += 360;
+    
+    turn_right = (diff > 0);
+    return abs(diff);
 }
 
 // ============================================================================
@@ -178,7 +208,8 @@ void processStateMachine() {
             Serial.println("[FSM] Entering Calibration Mode...");
             tracked_angle_start = getClosestObjectAngle();
             calibration_start_time = millis();
-            setMotors(PWM_20_PERCENT, 0); // Spin right
+            // True zero-radius pivot turn: Left forward, Right reverse
+            setMotors(PWM_20_PERCENT, -PWM_20_PERCENT); 
             current_state = STATE_CALIBRATE_TURN;
             break;
 
@@ -186,24 +217,21 @@ void processStateMachine() {
             int16_t current_closest = getClosestObjectAngle();
             if (current_closest == -1 || tracked_angle_start == -1) break;
 
-            // If the closest point has shifted almost 360 degrees (back to its starting relative position)
-            // We use a +/- 5 degree tolerance window to account for sensor noise.
             int diff = abs(current_closest - tracked_angle_start);
-            if (millis() - calibration_start_time > 1000) { // Prevent immediate trigger
+            if (millis() - calibration_start_time > 1000) { 
                 if (diff < 5 || diff > 355) {
                     uint32_t spin_time = millis() - calibration_start_time;
-                    millis_per_360_deg += spin_time; // Accumulate time
+                    millis_per_360_deg += spin_time; 
                     calibration_spins++;
                     
-                    Serial.printf("[CALIBRATION] Spin %d completed in %lu ms.\n", calibration_spins, spin_time);
+                    Serial.printf("[CALIBRATION] Pivot %d complete: %lu ms.\n", calibration_spins, spin_time);
                     
                     if (calibration_spins >= 3) {
-                        millis_per_360_deg /= 3.0f; // Average the 3 runs
+                        millis_per_360_deg /= 3.0f; 
                         setMotors(0, 0); // Stop
-                        Serial.printf("[CALIBRATION] Done. Avg ms/360deg: %.2f\n", millis_per_360_deg);
+                        Serial.printf("[CALIBRATION] Done. Avg ms/360deg pivot: %.2f\n", millis_per_360_deg);
                         current_state = STATE_FIND_CORNER;
                     } else {
-                        // Reset for next spin
                         tracked_angle_start = getClosestObjectAngle();
                         calibration_start_time = millis();
                     }
@@ -215,42 +243,42 @@ void processStateMachine() {
         case STATE_FIND_CORNER:
             target_heading = findClosestCorner();
             if (target_heading != -1) {
-                Serial.printf("[FSM] Closest corner found at %d degrees. Turning...\n", target_heading);
+                int16_t shortest_angle = getShortestTurn(target_heading, turning_right);
+                Serial.printf("[FSM] Corner at %d deg. Pivot turning %d deg...\n", target_heading, shortest_angle);
                 
-                // Calculate turn duration based on calibration
-                float turn_ratio = (float)target_heading / 360.0f;
+                float turn_ratio = (float)shortest_angle / 360.0f;
                 turn_duration = (uint32_t)(millis_per_360_deg * turn_ratio);
                 turn_start_time = millis();
                 
-                setMotors(PWM_20_PERCENT, 0); // Execute turn
+                if (turning_right) setMotors(PWM_20_PERCENT, -PWM_20_PERCENT);
+                else setMotors(-PWM_20_PERCENT, PWM_20_PERCENT);
+                
                 current_state = STATE_NAVIGATE_CORNER;
             } else {
-                Serial.println("[FSM] No distinct corner found. Defaulting to Wander mode.");
+                Serial.println("[FSM] No corner found. Wander mode.");
                 current_state = STATE_WANDER;
             }
             break;
 
         case STATE_NAVIGATE_CORNER:
-            // Wait for time-based turn to complete based on calibration
             if (millis() - turn_start_time >= turn_duration) {
-                Serial.println("[FSM] Turn complete. Driving to corner.");
-                setMotors(PWM_20_PERCENT, PWM_20_PERCENT);
+                Serial.println("[FSM] Pivot complete. Driving to target.");
+                setMotors(PWM_20_PERCENT, PWM_20_PERCENT); // Drive straight
                 current_state = STATE_WANDER;
             }
             break;
 
         case STATE_WANDER:
             if (isPathBlocked()) {
-                Serial.println("[NAV] Obstacle detected! Evading...");
-                // Stop, pick a clear direction (e.g., 90 degrees right)
-                target_heading = 90; 
+                Serial.println("[NAV] Obstacle! Executing 90-degree evasion pivot...");
+                
                 turn_duration = (uint32_t)(millis_per_360_deg * (90.0f / 360.0f));
                 turn_start_time = millis();
                 
-                setMotors(PWM_20_PERCENT, 0); // Turn right in place
-                current_state = STATE_NAVIGATE_CORNER; // Reuse the timed-turn state
+                // Pivot right
+                setMotors(PWM_20_PERCENT, -PWM_20_PERCENT); 
+                current_state = STATE_NAVIGATE_CORNER;
             } else {
-                // Coast is clear, keep driving
                 setMotors(PWM_20_PERCENT, PWM_20_PERCENT);
             }
             break;
@@ -263,16 +291,23 @@ void processStateMachine() {
 
 void setup() {
     Serial.begin(SERIAL_MONITOR_BAUD);
-    Serial.println("\n--- TANK BOT INITIALIZING ---");
+    Serial.println("\n--- 4-WHEEL TANK BOT INITIALIZING ---");
+
+    // Initialize L298N Direction Pins
+    pinMode(L298N_IN1, OUTPUT);
+    pinMode(L298N_IN2, OUTPUT);
+    pinMode(L298N_IN3, OUTPUT);
+    pinMode(L298N_IN4, OUTPUT);
 
     // Initialize Motor PWM
     ledcSetup(MOTOR_PWM_CHANNEL_LEFT, MOTOR_PWM_FREQ, MOTOR_PWM_RESOLUTION);
-    ledcAttachPin(LEFT_MOTOR_PIN, MOTOR_PWM_CHANNEL_LEFT);
+    ledcAttachPin(L298N_ENA, MOTOR_PWM_CHANNEL_LEFT);
     ledcSetup(MOTOR_PWM_CHANNEL_RIGHT, MOTOR_PWM_FREQ, MOTOR_PWM_RESOLUTION);
-    ledcAttachPin(RIGHT_MOTOR_PIN, MOTOR_PWM_CHANNEL_RIGHT);
+    ledcAttachPin(L298N_ENB, MOTOR_PWM_CHANNEL_RIGHT);
+    
     setMotors(0, 0); // Ensure stopped
 
-    // Initialize LiDAR (Static Allocation)
+    // Initialize LiDAR 
     static LDS_LDROBOT_LD14P static_lidar_instance;
     lidar = &static_lidar_instance;
 
@@ -286,14 +321,12 @@ void setup() {
     Serial.print("LiDAR model: ");
     Serial.println(lidar->getModelName());
 
-    LDS::result_t result = lidar->start();
-    Serial.printf("LiDAR Start Result: %s\n", lidar->resultCodeToString(result).c_str());
+    lidar->start();
 }
 
 void loop() {
-    lidar->loop(); // Must be called continuously
+    lidar->loop(); 
 
-    // Only process state machine once a full 360-degree sweep is updated
     if (scan_ready) {
         processStateMachine();
         scan_ready = false; 
